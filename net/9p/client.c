@@ -635,6 +635,51 @@ out_err:
 	return err;
 }
 
+static struct p9_fid *p9_fid_create(struct p9_client *clnt)
+{
+	int ret;
+	struct p9_fid *fid;
+
+	p9_debug(P9_DEBUG_FID, "clnt %p\n", clnt);
+	fid = kmalloc(sizeof(struct p9_fid), GFP_KERNEL);
+	if (!fid)
+		return NULL;
+
+	memset(&fid->qid, 0, sizeof(struct p9_qid));
+	fid->mode = -1;
+	fid->uid = current_fsuid();
+	fid->clnt = clnt;
+	fid->rdir = NULL;
+	fid->fid = 0;
+
+	idr_preload(GFP_KERNEL);
+	spin_lock_irq(&clnt->lock);
+	ret = idr_alloc_u32(&clnt->fids, fid, &fid->fid, P9_NOFID - 1,
+			    GFP_NOWAIT);
+	spin_unlock_irq(&clnt->lock);
+	idr_preload_end();
+
+	if (!ret)
+		return fid;
+
+	kfree(fid);
+	return NULL;
+}
+
+static void p9_fid_destroy(struct p9_fid *fid)
+{
+	struct p9_client *clnt;
+	unsigned long flags;
+
+	p9_debug(P9_DEBUG_FID, "fid %d\n", fid->fid);
+	clnt = fid->clnt;
+	spin_lock_irqsave(&clnt->lock, flags);
+	idr_remove(&clnt->fids, fid->fid);
+	spin_unlock_irqrestore(&clnt->lock, flags);
+	kfree(fid->rdir);
+	kfree(fid);
+}
+
 static struct p9_req_t *
 p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...);
 
@@ -764,6 +809,9 @@ static void p9_client_handle_async(struct p9_client *c, bool free_all)
 		}
 		if (free_all || req->status >= REQ_STATUS_RCVD) {
 			/* Put old refs whatever reqs actually returned */
+			if (req->tc.id == P9_TCLUNK) {
+				p9_fid_destroy(req->clunked_fid);
+			}
 			list_del(&req->async_list);
 			p9_tag_remove(c, req);
 		}
@@ -943,51 +991,6 @@ recalc_sigpending:
 reterr:
 	p9_tag_remove(c, req);
 	return ERR_PTR(safe_errno(err));
-}
-
-static struct p9_fid *p9_fid_create(struct p9_client *clnt)
-{
-	int ret;
-	struct p9_fid *fid;
-
-	p9_debug(P9_DEBUG_FID, "clnt %p\n", clnt);
-	fid = kmalloc(sizeof(struct p9_fid), GFP_KERNEL);
-	if (!fid)
-		return NULL;
-
-	memset(&fid->qid, 0, sizeof(struct p9_qid));
-	fid->mode = -1;
-	fid->uid = current_fsuid();
-	fid->clnt = clnt;
-	fid->rdir = NULL;
-	fid->fid = 0;
-
-	idr_preload(GFP_KERNEL);
-	spin_lock_irq(&clnt->lock);
-	ret = idr_alloc_u32(&clnt->fids, fid, &fid->fid, P9_NOFID - 1,
-			    GFP_NOWAIT);
-	spin_unlock_irq(&clnt->lock);
-	idr_preload_end();
-
-	if (!ret)
-		return fid;
-
-	kfree(fid);
-	return NULL;
-}
-
-static void p9_fid_destroy(struct p9_fid *fid)
-{
-	struct p9_client *clnt;
-	unsigned long flags;
-
-	p9_debug(P9_DEBUG_FID, "fid %d\n", fid->fid);
-	clnt = fid->clnt;
-	spin_lock_irqsave(&clnt->lock, flags);
-	idr_remove(&clnt->fids, fid->fid);
-	spin_unlock_irqrestore(&clnt->lock, flags);
-	kfree(fid->rdir);
-	kfree(fid);
 }
 
 static int p9_client_version(struct p9_client *c)
@@ -1520,7 +1523,6 @@ int p9_client_clunk(struct p9_fid *fid)
 	int err;
 	struct p9_client *clnt;
 	struct p9_req_t *req;
-	int retries = 0;
 
 	if (!fid) {
 		pr_warn("%s (%d): Trying to clunk with NULL fid\n",
@@ -1529,33 +1531,23 @@ int p9_client_clunk(struct p9_fid *fid)
 		return 0;
 	}
 
-again:
-	p9_debug(P9_DEBUG_9P, ">>> TCLUNK fid %d (try %d)\n", fid->fid,
-								retries);
+	p9_debug(P9_DEBUG_9P, ">>> TCLUNK fid %d\n", fid->fid);
 	err = 0;
 	clnt = fid->clnt;
 
-	req = p9_client_rpc(clnt, P9_TCLUNK, "d", fid->fid);
+	req = p9_client_async_rpc(clnt, P9_TCLUNK, "d", fid->fid);
 	if (IS_ERR(req)) {
-		err = PTR_ERR(req);
-		goto error;
+		return PTR_ERR(req);
 	}
 
-	p9_debug(P9_DEBUG_9P, "<<< RCLUNK fid %d\n", fid->fid);
+	p9_debug(P9_DEBUG_MUX, "sent clunk for fid %d, tag %d\n",
+		 fid->fid, req->tc.tag);
+	req->clunked_fid = fid;
+	spin_lock_irq(&clnt->lock);
+	list_add(&req->async_list, &clnt->async_req_list);
+	spin_unlock_irq(&clnt->lock);
 
-	p9_tag_remove(clnt, req);
-error:
-	/*
-	 * Fid is not valid even after a failed clunk
-	 * If interrupted, retry once then give up and
-	 * leak fid until umount.
-	 */
-	if (err == -ERESTARTSYS) {
-		if (retries++ == 0)
-			goto again;
-	} else
-		p9_fid_destroy(fid);
-	return err;
+	return 0;
 }
 EXPORT_SYMBOL(p9_client_clunk);
 
