@@ -655,6 +655,63 @@ static void p9_fid_destroy(struct p9_fid *fid)
 }
 
 static struct p9_req_t *
+p9_client_async_rpc(struct p9_client *c, int8_t type, const char *fmt, ...)
+{
+	va_list ap;
+	int err;
+	struct p9_req_t *req;
+
+	va_start(ap, fmt);
+	/* auto determine an appropriate request/response size */
+	req = p9_client_prepare_req(c, type, 0, 0, fmt, ap);
+	va_end(ap);
+	if (IS_ERR(req))
+		return req;
+
+	err = c->trans_mod->request(c, req);
+	if (err < 0) {
+		/* bail out without flushing... */
+		p9_req_put(c, req);
+		p9_tag_remove(c, req);
+		if (err != -ERESTARTSYS && err != -EFAULT)
+			c->status = Disconnected;
+		return ERR_PTR(safe_errno(err));
+	}
+
+	return req;
+}
+
+static void p9_client_handle_async(struct p9_client *c, bool free_all)
+{
+	struct p9_req_t *req, *nreq;
+
+	/* it's ok to miss some async replies here, do a quick check without
+	 * lock first unless called with free_all
+	 */
+	if (!free_all && list_empty(&c->async_req_list))
+		return;
+
+	spin_lock_irq(&c->async_req_lock);
+	list_for_each_entry_safe(req, nreq, &c->async_req_list, async_list) {
+		if (free_all && req->status < REQ_STATUS_RCVD) {
+			p9_debug(P9_DEBUG_ERROR,
+				 "final async handler found req tag %d type %d status %d\n",
+				 req->tc.tag, req->tc.id, req->status);
+			if (c->trans_mod->cancelled)
+				c->trans_mod->cancelled(c, req);
+			/* won't receive reply now */
+			p9_req_put(c, req);
+		}
+		if (free_all || req->status >= REQ_STATUS_RCVD) {
+			/* Put old refs whatever reqs actually returned */
+			list_del(&req->async_list);
+			p9_tag_remove(c, req);
+		}
+	}
+	spin_unlock_irq(&c->async_req_lock);
+}
+
+static struct p9_req_t *
 p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...);
 
 /**
@@ -722,6 +779,8 @@ p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...)
 	 */
 	const uint tsize = 0;
 	const uint rsize = c->trans_mod->pooled_rbuffers ? c->msize : 0;
+
+	p9_client_handle_async(c, 0);
 
 	va_start(ap, fmt);
 	req = p9_client_prepare_req(c, type, tsize, rsize, fmt, ap);
@@ -821,6 +880,8 @@ static struct p9_req_t *p9_client_zc_rpc(struct p9_client *c, int8_t type,
 	int sigpending, err;
 	unsigned long flags;
 	struct p9_req_t *req;
+
+	p9_client_handle_async(c, 0);
 
 	va_start(ap, fmt);
 	/* We allocate a inline protocol data of only 4k bytes.
@@ -984,6 +1045,8 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 	memcpy(clnt->name, client_id, strlen(client_id) + 1);
 
 	spin_lock_init(&clnt->lock);
+	spin_lock_init(&clnt->async_req_lock);
+	INIT_LIST_HEAD(&clnt->async_req_list);
 	idr_init(&clnt->fids);
 	idr_init(&clnt->reqs);
 
@@ -1059,6 +1122,8 @@ void p9_client_destroy(struct p9_client *clnt)
 		clnt->trans_mod->close(clnt);
 
 	v9fs_put_trans(clnt->trans_mod);
+
+	p9_client_handle_async(clnt, 1);
 
 	idr_for_each_entry(&clnt->fids, fid, id) {
 		pr_info("Found fid %d not clunked\n", fid->fid);
