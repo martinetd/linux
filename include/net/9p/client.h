@@ -72,7 +72,8 @@ enum p9_req_status_t {
  * @wq: wait_queue for the client to block on for this request
  * @tc: the request fcall structure
  * @rc: the response fcall structure
- * @req_list: link for higher level objects to chain requests
+ * @req_list: link for transports to chain requests (used by trans_fd)
+ * @async_list: link used to check on async requests
  */
 struct p9_req_t {
 	int status;
@@ -82,6 +83,7 @@ struct p9_req_t {
 	struct p9_fcall tc;
 	struct p9_fcall rc;
 	struct list_head req_list;
+	struct list_head async_list;
 };
 
 /**
@@ -92,6 +94,9 @@ struct p9_req_t {
  * @trans_mod: module API instantiated with this client
  * @status: connection state
  * @trans: tranport instance state and API
+ * @fcall_cache: kmem cache for client request data (msize-specific)
+ * @async_req_lock: protects @async_req_list
+ * @async_req_list: list of requests waiting a reply
  * @fids: All active FID handles
  * @reqs: All active requests.
  * @name: node name used as client id
@@ -107,6 +112,8 @@ struct p9_client {
 	enum p9_trans_status status;
 	void *trans;
 	struct kmem_cache *fcall_cache;
+	spinlock_t async_req_lock;
+	struct list_head async_req_list;
 
 	union {
 		struct {
