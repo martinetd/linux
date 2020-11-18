@@ -85,7 +85,7 @@ static void netfs_free_read_request(struct work_struct *work)
 	struct netfs_read_request *rreq =
 		container_of(work, struct netfs_read_request, work);
 	netfs_rreq_clear_subreqs(rreq, false);
-	if (rreq->netfs_priv)
+	if (rreq->netfs_priv && rreq->netfs_ops->cleanup)
 		rreq->netfs_ops->cleanup(rreq->mapping, rreq->netfs_priv);
 	trace_netfs_rreq(rreq, netfs_rreq_trace_free);
 	if (rreq->cache_resources.ops)
