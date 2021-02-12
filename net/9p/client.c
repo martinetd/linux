@@ -728,6 +728,8 @@ static void p9_client_handle_async(struct p9_client *c, bool free_all)
 						 "oldreq tag %d status %d still has ref\n",
 						 req->flushed_req->tc.tag,
 						 req->flushed_req->status);
+			} else if (req->tc.id == P9_TCLUNK) {
+				p9_fid_destroy(req->clunked_fid);
 			} else {
 				WARN(1, "Async request received with tc.id %d\n", req->tc.id);
 			}
@@ -1471,38 +1473,32 @@ EXPORT_SYMBOL(p9_client_fsync);
 
 int p9_client_clunk(struct p9_fid *fid)
 {
-	int err;
 	struct p9_client *clnt;
 	struct p9_req_t *req;
-	int retries = 0;
 
-again:
-	p9_debug(P9_DEBUG_9P, ">>> TCLUNK fid %d (try %d)\n",
-		 fid->fid, retries);
-	err = 0;
+	if (!fid || IS_ERR(fid)) {
+		pr_warn("%s (%d): Trying to clunk with invalid fid\n",
+			__func__, task_pid_nr(current));
+		dump_stack();
+		return 0;
+	}
+
+	p9_debug(P9_DEBUG_9P, ">>> TCLUNK fid %d\n", fid->fid);
 	clnt = fid->clnt;
 
-	req = p9_client_rpc(clnt, P9_TCLUNK, "d", fid->fid);
+	req = p9_client_async_rpc(clnt, P9_TCLUNK, "d", fid->fid);
 	if (IS_ERR(req)) {
-		err = PTR_ERR(req);
-		goto error;
+		return PTR_ERR(req);
 	}
 
-	p9_debug(P9_DEBUG_9P, "<<< RCLUNK fid %d\n", fid->fid);
+	p9_debug(P9_DEBUG_MUX, "sent clunk for fid %d, tag %d\n",
+		 fid->fid, req->tc.tag);
+	req->clunked_fid = fid;
+	spin_lock_irq(&clnt->lock);
+	list_add(&req->async_list, &clnt->async_req_list);
+	spin_unlock_irq(&clnt->lock);
 
-	p9_req_put(clnt, req);
-error:
-	/* Fid is not valid even after a failed clunk
-	 * If interrupted, retry once then give up and
-	 * leak fid until umount.
-	 */
-	if (err == -ERESTARTSYS) {
-		if (retries++ == 0)
-			goto again;
-	} else {
-		p9_fid_destroy(fid);
-	}
-	return err;
+	return 0;
 }
 EXPORT_SYMBOL(p9_client_clunk);
 
