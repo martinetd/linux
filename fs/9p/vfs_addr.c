@@ -54,7 +54,25 @@ static void v9fs_req_issue_op(struct netfs_read_subrequest *subreq)
  */
 static void v9fs_init_rreq(struct netfs_read_request *rreq, struct file *file)
 {
-	rreq->netfs_priv = file->private_data;
+	struct p9_fid *fid = file->private_data;
+
+	if (!fid) {
+		WARN_ONCE(1, "no fid set in file private data?\n");
+		return;
+	}
+	refcount_inc(&fid->count);
+	rreq->netfs_priv = fid;
+}
+
+/**
+ * v9fs_req_ceanup - Cleanup request initialized by v9fs_init_rreq
+ * @mapping: unused mapping of request to cleanup
+ * @priv: private data to cleanup, a fid, guaranted non-null.
+ */
+static void v9fs_req_cleanup(struct address_space *mapping, void *priv)
+{
+	struct p9_fid *fid = priv;
+	p9_client_clunk(fid);
 }
 
 /**
@@ -84,6 +102,7 @@ static const struct netfs_read_request_ops v9fs_req_ops = {
 	.is_cache_enabled	= v9fs_is_cache_enabled,
 	.begin_cache_operation	= v9fs_begin_cache_operation,
 	.issue_op		= v9fs_req_issue_op,
+	.cleanup		= v9fs_req_cleanup,
 };
 
 /**
