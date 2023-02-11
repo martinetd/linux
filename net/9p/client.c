@@ -432,6 +432,66 @@ static void p9_tag_cleanup(struct p9_client *c)
 	rcu_read_unlock();
 }
 
+static struct p9_fid *p9_fid_create(struct p9_client *clnt)
+{
+	int ret;
+	struct p9_fid *fid;
+
+	p9_debug(P9_DEBUG_FID, "clnt %p\n", clnt);
+	fid = kzalloc(sizeof(*fid), GFP_KERNEL);
+	if (!fid)
+		return NULL;
+
+	fid->mode = -1;
+	fid->uid = current_fsuid();
+	fid->clnt = clnt;
+	refcount_set(&fid->count, 1);
+
+	idr_preload(GFP_KERNEL);
+	spin_lock_irq(&clnt->lock);
+	ret = idr_alloc_u32(&clnt->fids, fid, &fid->fid, P9_NOFID - 1,
+			    GFP_NOWAIT);
+	spin_unlock_irq(&clnt->lock);
+	idr_preload_end();
+	if (!ret) {
+		trace_9p_fid_ref(fid, P9_FID_REF_CREATE);
+		return fid;
+	}
+
+	kfree(fid);
+	return NULL;
+}
+
+static void p9_fid_destroy(struct p9_fid *fid)
+{
+	struct p9_client *clnt;
+	unsigned long flags;
+
+	p9_debug(P9_DEBUG_FID, "fid %d\n", fid->fid);
+	trace_9p_fid_ref(fid, P9_FID_REF_DESTROY);
+	clnt = fid->clnt;
+	spin_lock_irqsave(&clnt->lock, flags);
+	idr_remove(&clnt->fids, fid->fid);
+	spin_unlock_irqrestore(&clnt->lock, flags);
+	kfree(fid->rdir);
+	kfree(fid);
+}
+
+/* We also need to export tracepoint symbols for tracepoint_enabled() */
+EXPORT_TRACEPOINT_SYMBOL(9p_fid_ref);
+
+void do_trace_9p_fid_get(struct p9_fid *fid)
+{
+	trace_9p_fid_ref(fid, P9_FID_REF_GET);
+}
+EXPORT_SYMBOL(do_trace_9p_fid_get);
+
+void do_trace_9p_fid_put(struct p9_fid *fid)
+{
+	trace_9p_fid_ref(fid, P9_FID_REF_PUT);
+}
+EXPORT_SYMBOL(do_trace_9p_fid_put);
+
 /**
  * p9_client_cb - call back from transport to client
  * @c: client state
@@ -574,6 +634,45 @@ out_err:
 	return err;
 }
 
+static struct p9_req_t *p9_client_prepare_req(struct p9_client *c,
+					      int8_t type, uint t_size, uint r_size,
+					      const char *fmt, va_list ap)
+{
+	int err;
+	struct p9_req_t *req;
+	va_list apc;
+
+	p9_debug(P9_DEBUG_MUX, "client %p op %d\n", c, type);
+
+	/* we allow for any status other than disconnected */
+	if (c->status == Disconnected)
+		return ERR_PTR(-EIO);
+
+	/* if status is begin_disconnected we allow only clunk request */
+	if (c->status == BeginDisconnect && type != P9_TCLUNK)
+		return ERR_PTR(-EIO);
+
+	va_copy(apc, ap);
+	req = p9_tag_alloc(c, type, t_size, r_size, fmt, apc);
+	va_end(apc);
+	if (IS_ERR(req))
+		return req;
+
+	/* marshall the data */
+	p9pdu_prepare(&req->tc, req->tc.tag, type);
+	err = p9pdu_vwritef(&req->tc, c->proto_version, fmt, ap);
+	if (err)
+		goto reterr;
+	p9pdu_finalize(c, &req->tc);
+	trace_9p_client_req(c, type, req->tc.tag);
+	return req;
+reterr:
+	p9_req_put(c, req);
+	/* We have to put also the 2nd reference as it won't be used */
+	p9_req_put(c, req);
+	return ERR_PTR(err);
+}
+
 static struct p9_req_t *
 p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...);
 
@@ -615,45 +714,6 @@ static int p9_client_flush(struct p9_client *c, struct p9_req_t *oldreq)
 
 	p9_req_put(c, req);
 	return 0;
-}
-
-static struct p9_req_t *p9_client_prepare_req(struct p9_client *c,
-					      int8_t type, uint t_size, uint r_size,
-					      const char *fmt, va_list ap)
-{
-	int err;
-	struct p9_req_t *req;
-	va_list apc;
-
-	p9_debug(P9_DEBUG_MUX, "client %p op %d\n", c, type);
-
-	/* we allow for any status other than disconnected */
-	if (c->status == Disconnected)
-		return ERR_PTR(-EIO);
-
-	/* if status is begin_disconnected we allow only clunk request */
-	if (c->status == BeginDisconnect && type != P9_TCLUNK)
-		return ERR_PTR(-EIO);
-
-	va_copy(apc, ap);
-	req = p9_tag_alloc(c, type, t_size, r_size, fmt, apc);
-	va_end(apc);
-	if (IS_ERR(req))
-		return req;
-
-	/* marshall the data */
-	p9pdu_prepare(&req->tc, req->tc.tag, type);
-	err = p9pdu_vwritef(&req->tc, c->proto_version, fmt, ap);
-	if (err)
-		goto reterr;
-	p9pdu_finalize(c, &req->tc);
-	trace_9p_client_req(c, type, req->tc.tag);
-	return req;
-reterr:
-	p9_req_put(c, req);
-	/* We have to put also the 2nd reference as it won't be used */
-	p9_req_put(c, req);
-	return ERR_PTR(err);
 }
 
 /**
@@ -841,66 +901,6 @@ reterr:
 	p9_req_put(c, req);
 	return ERR_PTR(safe_errno(err));
 }
-
-static struct p9_fid *p9_fid_create(struct p9_client *clnt)
-{
-	int ret;
-	struct p9_fid *fid;
-
-	p9_debug(P9_DEBUG_FID, "clnt %p\n", clnt);
-	fid = kzalloc(sizeof(*fid), GFP_KERNEL);
-	if (!fid)
-		return NULL;
-
-	fid->mode = -1;
-	fid->uid = current_fsuid();
-	fid->clnt = clnt;
-	refcount_set(&fid->count, 1);
-
-	idr_preload(GFP_KERNEL);
-	spin_lock_irq(&clnt->lock);
-	ret = idr_alloc_u32(&clnt->fids, fid, &fid->fid, P9_NOFID - 1,
-			    GFP_NOWAIT);
-	spin_unlock_irq(&clnt->lock);
-	idr_preload_end();
-	if (!ret) {
-		trace_9p_fid_ref(fid, P9_FID_REF_CREATE);
-		return fid;
-	}
-
-	kfree(fid);
-	return NULL;
-}
-
-static void p9_fid_destroy(struct p9_fid *fid)
-{
-	struct p9_client *clnt;
-	unsigned long flags;
-
-	p9_debug(P9_DEBUG_FID, "fid %d\n", fid->fid);
-	trace_9p_fid_ref(fid, P9_FID_REF_DESTROY);
-	clnt = fid->clnt;
-	spin_lock_irqsave(&clnt->lock, flags);
-	idr_remove(&clnt->fids, fid->fid);
-	spin_unlock_irqrestore(&clnt->lock, flags);
-	kfree(fid->rdir);
-	kfree(fid);
-}
-
-/* We also need to export tracepoint symbols for tracepoint_enabled() */
-EXPORT_TRACEPOINT_SYMBOL(9p_fid_ref);
-
-void do_trace_9p_fid_get(struct p9_fid *fid)
-{
-	trace_9p_fid_ref(fid, P9_FID_REF_GET);
-}
-EXPORT_SYMBOL(do_trace_9p_fid_get);
-
-void do_trace_9p_fid_put(struct p9_fid *fid)
-{
-	trace_9p_fid_ref(fid, P9_FID_REF_PUT);
-}
-EXPORT_SYMBOL(do_trace_9p_fid_put);
 
 static int p9_client_version(struct p9_client *c)
 {
