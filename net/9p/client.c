@@ -513,7 +513,13 @@ static void p9_client_async_cb(struct p9_client *c, struct p9_req_t *req)
 	if (likely(list_empty(&req->async_list)))
 		return;
 
-	WARN(1, "Async request received with tc.id %d\n", req->tc.id);
+	if (req->tc.id == P9_TCLUNK) {
+		p9_debug(P9_DEBUG_MUX, "async destroying fid %d\n",
+			 req->clunked_fid->fid);
+		p9_fid_destroy(req->clunked_fid);
+	} else {
+		WARN(1, "Async request received with tc.id %d\n", req->tc.id);
+	}
 
 	spin_lock_irqsave(&c->async_req_lock, flags);
 	list_del(&req->async_list);
@@ -1501,16 +1507,35 @@ error:
 }
 EXPORT_SYMBOL(p9_client_fsync);
 
+static int p9_client_async_clunk(struct p9_fid *fid)
+{
+	struct p9_client *clnt;
+	struct p9_req_t *req;
+
+	p9_debug(P9_DEBUG_9P, ">>> async TCLUNK fid %d\n", fid->fid);
+	clnt = fid->clnt;
+
+	req = p9_client_async_rpc(clnt, P9_TCLUNK, "d", fid->fid);
+	if (IS_ERR(req)) {
+		/* leak fid until umount... */
+		return PTR_ERR(req);
+	}
+
+	req->clunked_fid = fid;
+	spin_lock_irq(&clnt->lock);
+	list_add(&req->async_list, &clnt->async_req_list);
+	spin_unlock_irq(&clnt->lock);
+
+	return 0;
+}
+
 int p9_client_clunk(struct p9_fid *fid)
 {
 	int err;
 	struct p9_client *clnt;
 	struct p9_req_t *req;
-	int retries = 0;
 
-again:
-	p9_debug(P9_DEBUG_9P, ">>> TCLUNK fid %d (try %d)\n",
-		 fid->fid, retries);
+	p9_debug(P9_DEBUG_9P, ">>> TCLUNK fid %d\n", fid->fid);
 	err = 0;
 	clnt = fid->clnt;
 
@@ -1524,16 +1549,23 @@ again:
 
 	p9_req_put(clnt, req);
 error:
-	/* Fid is not valid even after a failed clunk
-	 * If interrupted, retry once then give up and
-	 * leak fid until umount.
+	/* Fid is not valid even after a failed clunk, but we do not
+	 * know if we successfully sent the request so send again
+	 * asynchronously ('err' cannot differentiate between:
+	 * failure on the client side before send, interrupted
+	 * before we sent the request, interrupted after we sent
+	 * the request and error from the server)
+	 * In doubt it's better to try to ask again (for the
+	 * 'interrupted before we sent the request' case), other
+	 * patterns will just ignore again.
+	 * Return the original error though.
 	 */
-	if (err == -ERESTARTSYS) {
-		if (retries++ == 0)
-			goto again;
-	} else {
-		p9_fid_destroy(fid);
+	if (err) {
+		p9_client_async_clunk(fid);
+		return err;
 	}
+
+	p9_fid_destroy(fid);
 	return err;
 }
 EXPORT_SYMBOL(p9_client_clunk);
