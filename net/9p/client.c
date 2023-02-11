@@ -286,8 +286,15 @@ p9_tag_alloc(struct p9_client *c, int8_t type, uint t_size, uint r_size,
 			    t_size ?: p9_msg_buf_size(c, type, fmt, apc));
 	va_end(apc);
 
-	alloc_rsize = min_t(size_t, c->msize,
-			    r_size ?: p9_msg_buf_size(c, type + 1, fmt, ap));
+	/* Currently RDMA transport is excluded from response message size
+	 * optimization, as it cannot cope with it due to its pooled response
+	 * buffers (this has no impact on request size)
+	 */
+	if (r_size == 0 && c->trans_mod->pooled_rbuffers)
+		alloc_rsize = c->msize;
+	else
+		alloc_rsize = min_t(size_t, c->msize,
+				    r_size ?: p9_msg_buf_size(c, type + 1, fmt, ap));
 
 	if (!req)
 		return ERR_PTR(-ENOMEM);
@@ -732,18 +739,10 @@ p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...)
 	int sigpending, err;
 	unsigned long flags;
 	struct p9_req_t *req;
-	/* Passing zero for tsize/rsize to p9_client_prepare_req() tells it to
-	 * auto determine an appropriate (small) request/response size
-	 * according to actual message data being sent. Currently RDMA
-	 * transport is excluded from this response message size optimization,
-	 * as it would not cope with it, due to its pooled response buffers
-	 * (using an optimized request size for RDMA as well though).
-	 */
-	const uint tsize = 0;
-	const uint rsize = c->trans_mod->pooled_rbuffers ? c->msize : 0;
 
 	va_start(ap, fmt);
-	req = p9_client_prepare_req(c, type, tsize, rsize, fmt, ap);
+	/* auto determine an appropriate request/response size */
+	req = p9_client_prepare_req(c, type, 0, 0, fmt, ap);
 	va_end(ap);
 	if (IS_ERR(req))
 		return req;
