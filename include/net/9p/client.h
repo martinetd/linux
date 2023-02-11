@@ -75,6 +75,7 @@ enum p9_req_status_t {
  * @req_list: link for transports to chain requests (used by trans_fd)
  * @async_list: link used to check on async requests
  * @clunked_fid: for clunk, points to fid
+ * @flushed_req: for flush, points to matching flushed req
  */
 struct p9_req_t {
 	int status;
@@ -87,6 +88,7 @@ struct p9_req_t {
 	struct list_head async_list;
 	union {
 		struct p9_fid *clunked_fid;
+		struct p9_req_t *flushed_req;
 	};
 };
 
