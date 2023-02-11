@@ -711,6 +711,26 @@ static void p9_client_handle_async(struct p9_client *c, bool free_all)
 		}
 		if (free_all || req->status >= REQ_STATUS_RCVD) {
 			/* Put old refs whatever reqs actually returned */
+			if (req->tc.id == P9_TFLUSH) {
+				p9_debug(P9_DEBUG_MUX,
+					 "flushing oldreq tag %d status %d, flush_req tag %d\n",
+					 req->flushed_req->tc.tag,
+					 req->flushed_req->status,
+					 req->tc.tag);
+				if (req->flushed_req->status < REQ_STATUS_RCVD) {
+					/* won't receive reply now */
+					if (c->trans_mod->cancelled)
+						c->trans_mod->cancelled(c, req);
+					p9_req_put(c, req->flushed_req);
+				}
+				if (!p9_req_put(c, req->flushed_req))
+					p9_debug(P9_DEBUG_ERROR,
+						 "oldreq tag %d status %d still has ref\n",
+						 req->flushed_req->tc.tag,
+						 req->flushed_req->status);
+			} else {
+				WARN(1, "Async request received with tc.id %d\n", req->tc.id);
+			}
 			list_del(&req->async_list);
 			p9_tag_remove(c, req);
 		}
@@ -736,28 +756,20 @@ p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...);
 static int p9_client_flush(struct p9_client *c, struct p9_req_t *oldreq)
 {
 	struct p9_req_t *req;
-	s16 oldtag;
-	int err;
-
-	err = p9_parse_header(&oldreq->tc, NULL, NULL, &oldtag, 1);
-	if (err)
-		return err;
+	s16 oldtag = oldreq->tc.tag;
 
 	p9_debug(P9_DEBUG_9P, ">>> TFLUSH tag %d\n", oldtag);
-
-	req = p9_client_rpc(c, P9_TFLUSH, "w", oldtag);
+	req = p9_client_async_rpc(c, P9_TFLUSH, "w", oldtag);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
-	/* if we haven't received a response for oldreq,
-	 * remove it from the list
-	 */
-	if (READ_ONCE(oldreq->status) == REQ_STATUS_SENT) {
-		if (c->trans_mod->cancelled)
-			c->trans_mod->cancelled(c, oldreq);
-	}
+	p9_debug(P9_DEBUG_MUX, "sent flush for oldreq %d type %d with flush tag %d\n",
+		 oldtag, oldreq->tc.id, req->tc.tag);
+	req->flushed_req = oldreq;
+	spin_lock_irq(&c->lock);
+	list_add(&req->async_list, &c->async_req_list);
+	spin_unlock_irq(&c->lock);
 
-	p9_req_put(c, req);
 	return 0;
 }
 
@@ -774,8 +786,8 @@ static struct p9_req_t *
 p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...)
 {
 	va_list ap;
-	int sigpending, err;
-	unsigned long flags;
+	int err;
+	int flushing = 0;
 	struct p9_req_t *req;
 
 	p9_client_handle_async(c, 0);
@@ -791,10 +803,10 @@ p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...)
 	req->rc.zc = false;
 
 	if (signal_pending(current)) {
-		sigpending = 1;
-		clear_thread_flag(TIF_SIGPENDING);
-	} else {
-		sigpending = 0;
+		err = -ERESTARTSYS;
+		/* write won't happen */
+		p9_req_put(c, req);
+		goto reterr;
 	}
 
 	err = c->trans_mod->request(c, req);
@@ -803,9 +815,9 @@ p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...)
 		p9_req_put(c, req);
 		if (err != -ERESTARTSYS && err != -EFAULT)
 			c->status = Disconnected;
-		goto recalc_sigpending;
+		goto reterr;
 	}
-again:
+
 	/* Wait for the response */
 	err = wait_event_killable(req->wq,
 				  READ_ONCE(req->status) >= REQ_STATUS_RCVD);
@@ -815,34 +827,15 @@ again:
 	 */
 	smp_rmb();
 
-	if (err == -ERESTARTSYS && c->status == Connected &&
-	    type == P9_TFLUSH) {
-		sigpending = 1;
-		clear_thread_flag(TIF_SIGPENDING);
-		goto again;
-	}
-
-	if (READ_ONCE(req->status) == REQ_STATUS_ERROR) {
+	if (req->status == REQ_STATUS_ERROR) {
 		p9_debug(P9_DEBUG_ERROR, "req_status error %d\n", req->t_err);
 		err = req->t_err;
 	}
 	if (err == -ERESTARTSYS && c->status == Connected) {
 		p9_debug(P9_DEBUG_MUX, "flushing\n");
-		sigpending = 1;
-		clear_thread_flag(TIF_SIGPENDING);
 
-		if (c->trans_mod->cancel(c, req))
-			p9_client_flush(c, req);
-
-		/* if we received the response anyway, don't signal error */
-		if (READ_ONCE(req->status) == REQ_STATUS_RCVD)
-			err = 0;
-	}
-recalc_sigpending:
-	if (sigpending) {
-		spin_lock_irqsave(&current->sighand->siglock, flags);
-		recalc_sigpending();
-		spin_unlock_irqrestore(&current->sighand->siglock, flags);
+		if (c->trans_mod->cancel(c, req) && !p9_client_flush(c, req))
+				flushing = 1;
 	}
 	if (err < 0)
 		goto reterr;
@@ -852,7 +845,8 @@ recalc_sigpending:
 	if (!err)
 		return req;
 reterr:
-	p9_req_put(c, req);
+	if (!flushing)
+		p9_req_put(c, req);
 	return ERR_PTR(safe_errno(err));
 }
 
@@ -876,8 +870,8 @@ static struct p9_req_t *p9_client_zc_rpc(struct p9_client *c, int8_t type,
 					 const char *fmt, ...)
 {
 	va_list ap;
-	int sigpending, err;
-	unsigned long flags;
+	int err;
+	int flushing = 0;
 	struct p9_req_t *req;
 
 	p9_client_handle_async(c, 0);
@@ -895,10 +889,10 @@ static struct p9_req_t *p9_client_zc_rpc(struct p9_client *c, int8_t type,
 	req->rc.zc = true;
 
 	if (signal_pending(current)) {
-		sigpending = 1;
-		clear_thread_flag(TIF_SIGPENDING);
-	} else {
-		sigpending = 0;
+		err = -ERESTARTSYS;
+		/* write won't happen */
+		p9_req_put(c, req);
+		goto reterr;
 	}
 
 	err = c->trans_mod->zc_request(c, req, uidata, uodata,
@@ -907,7 +901,7 @@ static struct p9_req_t *p9_client_zc_rpc(struct p9_client *c, int8_t type,
 		if (err == -EIO)
 			c->status = Disconnected;
 		if (err != -ERESTARTSYS)
-			goto recalc_sigpending;
+			goto reterr;
 	}
 	if (READ_ONCE(req->status) == REQ_STATUS_ERROR) {
 		p9_debug(P9_DEBUG_ERROR, "req_status error %d\n", req->t_err);
@@ -915,21 +909,9 @@ static struct p9_req_t *p9_client_zc_rpc(struct p9_client *c, int8_t type,
 	}
 	if (err == -ERESTARTSYS && c->status == Connected) {
 		p9_debug(P9_DEBUG_MUX, "flushing\n");
-		sigpending = 1;
-		clear_thread_flag(TIF_SIGPENDING);
 
-		if (c->trans_mod->cancel(c, req))
-			p9_client_flush(c, req);
-
-		/* if we received the response anyway, don't signal error */
-		if (READ_ONCE(req->status) == REQ_STATUS_RCVD)
-			err = 0;
-	}
-recalc_sigpending:
-	if (sigpending) {
-		spin_lock_irqsave(&current->sighand->siglock, flags);
-		recalc_sigpending();
-		spin_unlock_irqrestore(&current->sighand->siglock, flags);
+		if (c->trans_mod->cancel(c, req) && !p9_client_flush(c, req))
+			flushing = 1;
 	}
 	if (err < 0)
 		goto reterr;
@@ -939,7 +921,8 @@ recalc_sigpending:
 	if (!err)
 		return req;
 reterr:
-	p9_req_put(c, req);
+	if (!flushing)
+		p9_req_put(c, req);
 	return ERR_PTR(safe_errno(err));
 }
 

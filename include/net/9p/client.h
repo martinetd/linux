@@ -74,6 +74,7 @@ enum p9_req_status_t {
  * @rc: the response fcall structure
  * @req_list: link for transports to chain requests (used by trans_fd)
  * @async_list: link used to check on async requests
+ * @flushed_req: for flush, points to matching flushed req
  */
 struct p9_req_t {
 	int status;
@@ -84,6 +85,9 @@ struct p9_req_t {
 	struct p9_fcall rc;
 	struct list_head req_list;
 	struct list_head async_list;
+	union {
+		struct p9_req_t *flushed_req;
+	};
 };
 
 /**
