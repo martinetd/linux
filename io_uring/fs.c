@@ -47,6 +47,13 @@ struct io_link {
 	int				flags;
 };
 
+struct io_getdents {
+	struct file			*file;
+	struct linux_dirent64 __user	*dirent;
+	unsigned int			count;
+	int				flags;
+};
+
 int io_renameat_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_rename *ren = io_kiocb_to_cmd(req, struct io_rename);
@@ -291,3 +298,53 @@ void io_link_cleanup(struct io_kiocb *req)
 	putname(sl->oldpath);
 	putname(sl->newpath);
 }
+
+int io_getdents_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+{
+	struct io_getdents *gd = io_kiocb_to_cmd(req, struct io_getdents);
+
+	if (READ_ONCE(sqe->off) != 0)
+		return -EINVAL;
+
+	gd->dirent = u64_to_user_ptr(READ_ONCE(sqe->addr));
+	gd->count = READ_ONCE(sqe->len);
+	gd->flags = READ_ONCE(sqe->getdents_flags);
+	if (gd->flags & ~IORING_GETDENTS_REWIND)
+		return -EINVAL;
+	/* rewind cannot be nowait */
+	if (gd->flags & IORING_GETDENTS_REWIND)
+		req->flags |= REQ_F_FORCE_ASYNC;
+
+	return 0;
+}
+
+int io_getdents(struct io_kiocb *req, unsigned int issue_flags)
+{
+	struct io_getdents *gd = io_kiocb_to_cmd(req, struct io_getdents);
+	unsigned long getdents_flags = 0;
+	int ret;
+
+	if (issue_flags & IO_URING_F_NONBLOCK) {
+		if (!(req->file->f_mode & FMODE_NOWAIT))
+			return -EAGAIN;
+
+		getdents_flags = DIR_CONTEXT_F_NOWAIT;
+	}
+	if ((gd->flags & IORING_GETDENTS_REWIND)) {
+		WARN_ON_ONCE(issue_flags & IO_URING_F_NONBLOCK);
+
+		ret = vfs_llseek(req->file, 0, SEEK_SET);
+		if (ret < 0)
+			goto out;
+	}
+
+	ret = vfs_getdents(req->file, gd->dirent, gd->count, getdents_flags);
+out:
+	if (ret == -EAGAIN &&
+	    (issue_flags & IO_URING_F_NONBLOCK))
+			return -EAGAIN;
+
+	io_req_set_res(req, ret, 0);
+	return 0;
+}
+
