@@ -208,10 +208,12 @@ int dcache_readdir(struct file *file, struct dir_context *ctx)
 		p = &next->d_child;
 	}
 	spin_lock(&dentry->d_lock);
-	if (next)
+	if (next) {
 		list_move_tail(&cursor->d_child, &next->d_child);
-	else
+	} else {
 		list_del_init(&cursor->d_child);
+		ctx->flags |= DIR_CONTEXT_F_EOD;
+	}
 	spin_unlock(&dentry->d_lock);
 	dput(next);
 
@@ -1347,7 +1349,8 @@ static loff_t empty_dir_llseek(struct file *file, loff_t offset, int whence)
 
 static int empty_dir_readdir(struct file *file, struct dir_context *ctx)
 {
-	dir_emit_dots(file, ctx);
+	if (dir_emit_dots(file, ctx))
+		ctx->flags |= DIR_CONTEXT_F_EOD;
 	return 0;
 }
 

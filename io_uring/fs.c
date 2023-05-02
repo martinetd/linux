@@ -322,6 +322,7 @@ int io_getdents(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_getdents *gd = io_kiocb_to_cmd(req, struct io_getdents);
 	unsigned long getdents_flags = 0;
+	u32 cqe_flags = 0;
 	int ret;
 
 	if (issue_flags & IO_URING_F_NONBLOCK) {
@@ -338,13 +339,16 @@ int io_getdents(struct io_kiocb *req, unsigned int issue_flags)
 			goto out;
 	}
 
-	ret = vfs_getdents(req->file, gd->dirent, gd->count, getdents_flags);
+	ret = vfs_getdents(req->file, gd->dirent, gd->count, &getdents_flags);
 out:
 	if (ret == -EAGAIN &&
 	    (issue_flags & IO_URING_F_NONBLOCK))
 			return -EAGAIN;
 
-	io_req_set_res(req, ret, 0);
+	if (getdents_flags & DIR_CONTEXT_F_EOD)
+		cqe_flags |= IORING_CQE_F_EOF;
+
+	io_req_set_res(req, ret, cqe_flags);
 	return 0;
 }
 

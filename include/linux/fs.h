@@ -1723,8 +1723,10 @@ struct dir_context {
  * flags for dir_context flags
  * DIR_CONTEXT_F_NOWAIT: Request non-blocking iterate
  *                       (requires file->f_mode & FMODE_NOWAIT)
+ * DIR_CONTEXT_F_EOD: Signal directory has been fully iterated, set by the fs
  */
 #define DIR_CONTEXT_F_NOWAIT	0x1
+#define DIR_CONTEXT_F_EOD	0x2
 
 /*
  * These flags let !MMU mmap() govern direct device mapping vs immediate

@@ -358,14 +358,14 @@ efault:
  * @file    : pointer to file struct of directory
  * @dirent  : pointer to user directory structure
  * @count   : size of buffer
- * @flags   : additional dir_context flags
+ * @flags   : pointer to additional dir_context flags
  */
 int vfs_getdents(struct file *file, struct linux_dirent64 __user *dirent,
-		 unsigned int count, unsigned long flags)
+		 unsigned int count, unsigned long *flags)
 {
 	struct getdents_callback64 buf = {
 		.ctx.actor = filldir64,
-		.ctx.flags = flags,
+		.ctx.flags = flags ? *flags : 0,
 		.count = count,
 		.current_dir = dirent
 	};
@@ -384,6 +384,8 @@ int vfs_getdents(struct file *file, struct linux_dirent64 __user *dirent,
 		else
 			error = count - buf.count;
 	}
+	if (flags)
+		*flags = buf.ctx.flags;
 	return error;
 }
 
@@ -397,7 +399,7 @@ SYSCALL_DEFINE3(getdents64, unsigned int, fd,
 	if (!f.file)
 		return -EBADF;
 
-	error = vfs_getdents(f.file, dirent, count, 0);
+	error = vfs_getdents(f.file, dirent, count, NULL);
 
 	fdput_pos(f);
 	return error;

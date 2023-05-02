@@ -1859,6 +1859,7 @@ static int kernfs_fop_readdir(struct file *file, struct dir_context *ctx)
 	up_read(&root->kernfs_rwsem);
 	file->private_data = NULL;
 	ctx->pos = INT_MAX;
+	ctx->flags |= DIR_CONTEXT_F_EOD;
 	return 0;
 }
 
