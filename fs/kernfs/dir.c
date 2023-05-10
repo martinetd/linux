@@ -1824,7 +1824,12 @@ static int kernfs_fop_readdir(struct file *file, struct dir_context *ctx)
 		return 0;
 
 	root = kernfs_root(parent);
-	down_read(&root->kernfs_rwsem);
+	if (ctx->flags & DIR_CONTEXT_F_NOWAIT) {
+		if (!down_read_trylock(&root->kernfs_rwsem))
+			return -EAGAIN;
+	} else {
+		down_read(&root->kernfs_rwsem);
+	}
 
 	if (kernfs_ns_enabled(parent))
 		ns = kernfs_info(dentry->d_sb)->ns;
@@ -1844,7 +1849,12 @@ static int kernfs_fop_readdir(struct file *file, struct dir_context *ctx)
 		up_read(&root->kernfs_rwsem);
 		if (!dir_emit(ctx, name, len, ino, type))
 			return 0;
-		down_read(&root->kernfs_rwsem);
+		if (ctx->flags & DIR_CONTEXT_F_NOWAIT) {
+			if (!down_read_trylock(&root->kernfs_rwsem))
+				return 0;
+		} else {
+			down_read(&root->kernfs_rwsem);
+		}
 	}
 	up_read(&root->kernfs_rwsem);
 	file->private_data = NULL;
@@ -1852,7 +1862,14 @@ static int kernfs_fop_readdir(struct file *file, struct dir_context *ctx)
 	return 0;
 }
 
+static int kernfs_fop_dir_open(struct inode *inode, struct file *file)
+{
+	file->f_mode |= FMODE_NOWAIT;
+	return 0;
+}
+
 const struct file_operations kernfs_dir_fops = {
+	.open		= kernfs_fop_dir_open,
 	.read		= generic_read_dir,
 	.iterate_shared	= kernfs_fop_readdir,
 	.release	= kernfs_dir_fop_release,
