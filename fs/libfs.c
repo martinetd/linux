@@ -81,6 +81,7 @@ EXPORT_SYMBOL(simple_lookup);
 int dcache_dir_open(struct inode *inode, struct file *file)
 {
 	file->private_data = d_alloc_cursor(file->f_path.dentry);
+	file->f_mode |= FMODE_NOWAIT;
 
 	return file->private_data ? 0 : -ENOMEM;
 }
